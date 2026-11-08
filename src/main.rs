@@ -7,10 +7,10 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use log::{error, info};
-use rusty_ytdl::{Video, VideoOptions, VideoQuality, VideoSearchOptions};
+use log::{error, info, warn};
+use rusty_ytdl::{DownloadOptions, Video, VideoOptions, VideoQuality, VideoSearchOptions};
 use whatsapp_rust::{
-    media::{document_message, DocumentOptions},
+    media::{DocumentOptions, document_message},
     pair_code::PairCodeOptions,
     prelude::*,
     upload::UploadOptions,
@@ -158,24 +158,65 @@ async fn download_youtube(
     })
     .await?;
 
-    let options = VideoOptions {
-        quality: VideoQuality::Lowest,
-        filter: if audio_only {
-            VideoSearchOptions::Audio
+    let filter = if audio_only {
+        VideoSearchOptions::Audio
+    } else {
+        VideoSearchOptions::Video
+    };
+    let download_options = DownloadOptions {
+        // Smaller ranges are accepted more consistently by googlevideo,
+        // especially for short or low-resolution formats.
+        dl_chunk_size: Some(1024 * 1024),
+    };
+    let initial_options = VideoOptions {
+        quality: if audio_only {
+            VideoQuality::LowestAudio
         } else {
-            VideoSearchOptions::Video
+            VideoQuality::LowestVideo
         },
+        filter: filter.clone(),
+        download_options: download_options.clone(),
         ..Default::default()
     };
-    let video = Video::new_with_options(url.to_owned(), options)?;
-    let info = video.get_info().await?;
+    let initial_video = Video::new_with_options(url.to_owned(), initial_options)?;
+    let info = initial_video.get_info().await?;
     let title = sanitize_filename(&info.video_details.title);
     let extension = if audio_only { "m4a" } else { "mp4" };
-    let file_name = format!("{title}-{}.{}", video.get_video_id(), extension);
+    let file_name = format!("{title}-{}.{}", initial_video.get_video_id(), extension);
     let path = temporary_download_path(&file_name);
 
+    let qualities = if audio_only {
+        vec![VideoQuality::LowestAudio, VideoQuality::HighestAudio]
+    } else {
+        vec![VideoQuality::LowestVideo, VideoQuality::HighestVideo]
+    };
+    let mut last_error = None;
+    for quality in qualities {
+        let options = VideoOptions {
+            quality,
+            filter: filter.clone(),
+            download_options: download_options.clone(),
+            ..Default::default()
+        };
+        let video = Video::new_with_options(url.to_owned(), options)?;
+        match video.download(&path).await {
+            Ok(()) => {
+                last_error = None;
+                break;
+            }
+            Err(err) => {
+                warn!("YouTube format attempt failed: {err}");
+                last_error = Some(err.to_string());
+                let _ = tokio::fs::remove_file(&path).await;
+            }
+        }
+    }
+
+    if let Some(err) = last_error {
+        return Err(format!("فشل تنزيل جميع الصيغ المتاحة: {err}").into());
+    }
+
     let result = async {
-        video.download(&path).await?;
         let metadata = tokio::fs::metadata(&path).await?;
         if metadata.len() > MAX_FILE_SIZE {
             return Err::<(), Box<dyn Error + Send + Sync>>(
@@ -189,7 +230,10 @@ async fn download_youtube(
 
     if let Err(err) = tokio::fs::remove_file(&path).await {
         if err.kind() != io::ErrorKind::NotFound {
-            error!("Failed to remove temporary download {}: {err}", path.display());
+            error!(
+                "Failed to remove temporary download {}: {err}",
+                path.display()
+            );
         }
     }
     result
@@ -213,7 +257,11 @@ fn sanitize_filename(value: &str) -> String {
         })
         .collect();
     let trimmed = cleaned.trim().trim_matches('.');
-    let result = if trimmed.is_empty() { "youtube-download" } else { trimmed };
+    let result = if trimmed.is_empty() {
+        "youtube-download"
+    } else {
+        trimmed
+    };
     result.chars().take(100).collect()
 }
 
@@ -330,7 +378,10 @@ mod tests {
 
     #[test]
     fn bot_commands_are_supported() {
-        assert_eq!(response_for_text("/ping").as_deref(), Some("Pong — البوت يعمل."));
+        assert_eq!(
+            response_for_text("/ping").as_deref(),
+            Some("Pong — البوت يعمل.")
+        );
         assert_eq!(response_for_text("/echo hello").as_deref(), Some("hello"));
         assert!(response_for_text("/yt https://youtube.com/watch?v=abc").is_none());
     }
